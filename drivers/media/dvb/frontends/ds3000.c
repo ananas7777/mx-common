@@ -1,8 +1,8 @@
 /*
-    Montage Technology DS3000/TS2020 - DVBS/S2 Demodulator/Tuner driver
-    Copyright (C) 2009 Konstantin Dimitrov <kosio.dimitrov@gmail.com>
+    Montage Technology DS3000 - DVBS/S2 Demodulator driver
+    Copyright (C) 2009-2012 Konstantin Dimitrov <kosio.dimitrov@gmail.com>
 
-    Copyright (C) 2009 TurboSight.com
+    Copyright (C) 2009-2012 TurboSight.com 
 
     This program is free software; you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -42,7 +42,6 @@ static int debug;
 #define DS3000_DEFAULT_FIRMWARE "dvb-fe-ds3000.fw"
 
 #define DS3000_SAMPLE_RATE 96000 /* in kHz */
-#define DS3000_XTAL_FREQ   27000 /* in kHz */
 
 /* Register values to initialise the demod in DVB-S mode */
 static u8 ds3000_dvbs_init_tab[] = {
@@ -233,7 +232,6 @@ struct ds3000_state {
 	struct i2c_adapter *i2c;
 	const struct ds3000_config *config;
 	struct dvb_frontend frontend;
-	u8 skip_fw_load;
 	/* previous uncorrected block counter for DVB-S2 */
 	u16 prevUCBS2;
 };
@@ -257,23 +255,13 @@ static int ds3000_writereg(struct ds3000_state *state, int reg, int data)
 	return 0;
 }
 
-static int ds3000_tuner_writereg(struct ds3000_state *state, int reg, int data)
+static int ds3000_i2c_gate_ctrl(struct dvb_frontend *fe, int enable)
 {
-	u8 buf[] = { reg, data };
-	struct i2c_msg msg = { .addr = 0x60,
-		.flags = 0, .buf = buf, .len = 2 };
-	int err;
-
-	dprintk("%s: write reg 0x%02x, value 0x%02x\n", __func__, reg, data);
-
-	ds3000_writereg(state, 0x03, 0x11);
-	err = i2c_transfer(state->i2c, &msg, 1);
-	if (err != 1) {
-		printk("%s: writereg error(err == %i, reg == 0x%02x,"
-			 " value == 0x%02x)\n", __func__, err, reg, data);
-		return -EREMOTEIO;
-	}
-
+	struct ds3000_state *state = fe->demodulator_priv;
+	if (enable)
+		ds3000_writereg(state, 0x03, 0x12);
+	else
+		ds3000_writereg(state, 0x03, 0x02);
 	return 0;
 }
 
@@ -281,15 +269,14 @@ static int ds3000_tuner_writereg(struct ds3000_state *state, int reg, int data)
 static int ds3000_writeFW(struct ds3000_state *state, int reg,
 				const u8 *data, u16 len)
 {
-	int i, ret = -EREMOTEIO;
+	int i, ret = 0;
 	struct i2c_msg msg;
 	u8 *buf;
 
 	buf = kmalloc(33, GFP_KERNEL);
 	if (buf == NULL) {
 		printk(KERN_ERR "Unable to kmalloc\n");
-		ret = -ENOMEM;
-		goto error;
+		return -ENOMEM;
 	}
 
 	*(buf) = reg;
@@ -309,9 +296,11 @@ static int ds3000_writeFW(struct ds3000_state *state, int reg,
 			printk(KERN_ERR "%s: write error(err == %i, "
 				"reg == 0x%02x\n", __func__, ret, reg);
 			ret = -EREMOTEIO;
+			goto error;
 		}
 	}
-
+	ret = 0;
+	
 error:
 	kfree(buf);
 
@@ -349,37 +338,7 @@ static int ds3000_readreg(struct ds3000_state *state, u8 reg)
 	return b1[0];
 }
 
-static int ds3000_tuner_readreg(struct ds3000_state *state, u8 reg)
-{
-	int ret;
-	u8 b0[] = { reg };
-	u8 b1[] = { 0 };
-	struct i2c_msg msg[] = {
-		{
-			.addr = 0x60,
-			.flags = 0,
-			.buf = b0,
-			.len = 1
-		}, {
-			.addr = 0x60,
-			.flags = I2C_M_RD,
-			.buf = b1,
-			.len = 1
-		}
-	};
 
-	ds3000_writereg(state, 0x03, 0x12);
-	ret = i2c_transfer(state->i2c, msg, 2);
-
-	if (ret != 2) {
-		printk(KERN_ERR "%s: reg=0x%x(error=%d)\n", __func__, reg, ret);
-		return ret;
-	}
-
-	dprintk("%s: read reg 0x%02x, value 0x%02x\n", __func__, reg, b1[0]);
-
-	return b1[0];
-}
 
 static int ds3000_load_firmware(struct dvb_frontend *fe,
 					const struct firmware *fw);
@@ -392,11 +351,10 @@ static int ds3000_firmware_ondemand(struct dvb_frontend *fe)
 
 	dprintk("%s()\n", __func__);
 
-	if (ds3000_readreg(state, 0xb2) <= 0)
+  ret = ds3000_readreg(state, 0xb2);
+  if (ret < 0) 
 		return ret;
 
-	if (state->skip_fw_load)
-		return 0;
 	/* Load firmware */
 	/* request the firmware, this will block until someone uploads it */
 	printk(KERN_INFO "%s: Waiting for firmware upload (%s)...\n", __func__,
@@ -410,8 +368,6 @@ static int ds3000_firmware_ondemand(struct dvb_frontend *fe)
 		return ret;
 	}
 
-	/* Make sure we don't recurse back through here during loading */
-	state->skip_fw_load = 1;
 
 	ret = ds3000_load_firmware(fe, fw);
 	if (ret)
@@ -422,9 +378,6 @@ static int ds3000_firmware_ondemand(struct dvb_frontend *fe)
 	dprintk("%s: Firmware upload %s\n", __func__,
 			ret == 0 ? "complete" : "failed");
 
-	/* Ensure firmware is always loaded if required */
-	state->skip_fw_load = 0;
-
 	return ret;
 }
 
@@ -432,6 +385,7 @@ static int ds3000_load_firmware(struct dvb_frontend *fe,
 					const struct firmware *fw)
 {
 	struct ds3000_state *state = fe->demodulator_priv;
+	int ret = 0;
 
 	dprintk("%s\n", __func__);
 	dprintk("Firmware is %zu bytes (%02x %02x .. %02x %02x)\n",
@@ -444,10 +398,10 @@ static int ds3000_load_firmware(struct dvb_frontend *fe,
 	/* Begin the firmware load process */
 	ds3000_writereg(state, 0xb2, 0x01);
 	/* write the entire firmware */
-	ds3000_writeFW(state, 0xb0, fw->data, fw->size);
+	ret = ds3000_writeFW(state, 0xb0, fw->data, fw->size);
 	ds3000_writereg(state, 0xb2, 0x00);
 
-	return 0;
+	return ret;
 }
 
 static int ds3000_set_voltage(struct dvb_frontend *fe, fe_sec_voltage_t voltage)
@@ -505,7 +459,9 @@ static int ds3000_read_status(struct dvb_frontend *fe, fe_status_t* status)
 	default:
 		return 1;
 	}
-
+	if (state->config->set_lock_led)
+		state->config->set_lock_led(fe, *status == 0 ? 0 : 1);
+	
 	dprintk("%s: status = 0x%02x\n", __func__, lock);
 
 	return 0;
@@ -580,29 +536,8 @@ static int ds3000_read_ber(struct dvb_frontend *fe, u32* ber)
 static int ds3000_read_signal_strength(struct dvb_frontend *fe,
 						u16 *signal_strength)
 {
-	struct ds3000_state *state = fe->demodulator_priv;
-	u16 sig_reading, sig_strength;
-	u8 rfgain, bbgain;
-
-	dprintk("%s()\n", __func__);
-
-	rfgain = ds3000_tuner_readreg(state, 0x3d) & 0x1f;
-	bbgain = ds3000_tuner_readreg(state, 0x21) & 0x1f;
-
-	if (rfgain > 15)
-		rfgain = 15;
-	if (bbgain > 13)
-		bbgain = 13;
-
-	sig_reading = rfgain * 2 + bbgain * 3;
-
-	sig_strength = 40 + (64 - sig_reading) * 50 / 64 ;
-
-	/* cook the value to be suitable for szap-s2 human readable output */
-	*signal_strength = sig_strength * 1000;
-
-	dprintk("%s: raw / cooked = 0x%04x / 0x%04x\n", __func__,
-			sig_reading, *signal_strength);
+	if (fe->ops.tuner_ops.get_rf_strength)
+    fe->ops.tuner_ops.get_rf_strength(fe, signal_strength);
 
 	return 0;
 }
@@ -886,6 +821,10 @@ static int ds3000_diseqc_send_burst(struct dvb_frontend *fe,
 static void ds3000_release(struct dvb_frontend *fe)
 {
 	struct ds3000_state *state = fe->demodulator_priv;
+
+	if (state->config->set_lock_led)
+		state->config->set_lock_led(fe, 0);
+		
 	dprintk("%s\n", __func__);
 	kfree(state);
 }
@@ -975,134 +914,17 @@ static int ds3000_set_frontend(struct dvb_frontend *fe,
 
 	int i;
 	fe_status_t status;
-	u8 mlpf, mlpf_new, mlpf_max, mlpf_min, nlpf, div4;
 	s32 offset_khz;
-	u16 value, ndiv;
-	u32 f3db;
+    u32 frequency;
+    u16 value;	
 
 	dprintk("%s() ", __func__);
 
 	if (state->config->set_ts_params)
 		state->config->set_ts_params(fe, 0);
 	/* Tune */
-	/* unknown */
-	ds3000_tuner_writereg(state, 0x07, 0x02);
-	ds3000_tuner_writereg(state, 0x10, 0x00);
-	ds3000_tuner_writereg(state, 0x60, 0x79);
-	ds3000_tuner_writereg(state, 0x08, 0x01);
-	ds3000_tuner_writereg(state, 0x00, 0x01);
-	div4 = 0;
-
-	/* calculate and set freq divider */
-	if (p->frequency < 1146000) {
-		ds3000_tuner_writereg(state, 0x10, 0x11);
-		div4 = 1;
-		ndiv = ((p->frequency * (6 + 8) * 4) +
-				(DS3000_XTAL_FREQ / 2)) /
-				DS3000_XTAL_FREQ - 1024;
-	} else {
-		ds3000_tuner_writereg(state, 0x10, 0x01);
-		ndiv = ((p->frequency * (6 + 8) * 2) +
-				(DS3000_XTAL_FREQ / 2)) /
-				DS3000_XTAL_FREQ - 1024;
-	}
-
-	ds3000_tuner_writereg(state, 0x01, (ndiv & 0x0f00) >> 8);
-	ds3000_tuner_writereg(state, 0x02, ndiv & 0x00ff);
-
-	/* set pll */
-	ds3000_tuner_writereg(state, 0x03, 0x06);
-	ds3000_tuner_writereg(state, 0x51, 0x0f);
-	ds3000_tuner_writereg(state, 0x51, 0x1f);
-	ds3000_tuner_writereg(state, 0x50, 0x10);
-	ds3000_tuner_writereg(state, 0x50, 0x00);
-	msleep(5);
-
-	/* unknown */
-	ds3000_tuner_writereg(state, 0x51, 0x17);
-	ds3000_tuner_writereg(state, 0x51, 0x1f);
-	ds3000_tuner_writereg(state, 0x50, 0x08);
-	ds3000_tuner_writereg(state, 0x50, 0x00);
-	msleep(5);
-
-	value = ds3000_tuner_readreg(state, 0x3d);
-	value &= 0x0f;
-	if ((value > 4) && (value < 15)) {
-		value -= 3;
-		if (value < 4)
-			value = 4;
-		value = ((value << 3) | 0x01) & 0x79;
-	}
-
-	ds3000_tuner_writereg(state, 0x60, value);
-	ds3000_tuner_writereg(state, 0x51, 0x17);
-	ds3000_tuner_writereg(state, 0x51, 0x1f);
-	ds3000_tuner_writereg(state, 0x50, 0x08);
-	ds3000_tuner_writereg(state, 0x50, 0x00);
-
-	/* set low-pass filter period */
-	ds3000_tuner_writereg(state, 0x04, 0x2e);
-	ds3000_tuner_writereg(state, 0x51, 0x1b);
-	ds3000_tuner_writereg(state, 0x51, 0x1f);
-	ds3000_tuner_writereg(state, 0x50, 0x04);
-	ds3000_tuner_writereg(state, 0x50, 0x00);
-	msleep(5);
-
-	f3db = ((c->symbol_rate / 1000) << 2) / 5 + 2000;
-	if ((c->symbol_rate / 1000) < 5000)
-		f3db += 3000;
-	if (f3db < 7000)
-		f3db = 7000;
-	if (f3db > 40000)
-		f3db = 40000;
-
-	/* set low-pass filter baseband */
-	value = ds3000_tuner_readreg(state, 0x26);
-	mlpf = 0x2e * 207 / ((value << 1) + 151);
-	mlpf_max = mlpf * 135 / 100;
-	mlpf_min = mlpf * 78 / 100;
-	if (mlpf_max > 63)
-		mlpf_max = 63;
-
-	/* rounded to the closest integer */
-	nlpf = ((mlpf * f3db * 1000) + (2766 * DS3000_XTAL_FREQ / 2))
-			/ (2766 * DS3000_XTAL_FREQ);
-	if (nlpf > 23)
-		nlpf = 23;
-	if (nlpf < 1)
-		nlpf = 1;
-
-	/* rounded to the closest integer */
-	mlpf_new = ((DS3000_XTAL_FREQ * nlpf * 2766) +
-			(1000 * f3db / 2)) / (1000 * f3db);
-
-	if (mlpf_new < mlpf_min) {
-		nlpf++;
-		mlpf_new = ((DS3000_XTAL_FREQ * nlpf * 2766) +
-				(1000 * f3db / 2)) / (1000 * f3db);
-	}
-
-	if (mlpf_new > mlpf_max)
-		mlpf_new = mlpf_max;
-
-	ds3000_tuner_writereg(state, 0x04, mlpf_new);
-	ds3000_tuner_writereg(state, 0x06, nlpf);
-	ds3000_tuner_writereg(state, 0x51, 0x1b);
-	ds3000_tuner_writereg(state, 0x51, 0x1f);
-	ds3000_tuner_writereg(state, 0x50, 0x04);
-	ds3000_tuner_writereg(state, 0x50, 0x00);
-	msleep(5);
-
-	/* unknown */
-	ds3000_tuner_writereg(state, 0x51, 0x1e);
-	ds3000_tuner_writereg(state, 0x51, 0x1f);
-	ds3000_tuner_writereg(state, 0x50, 0x01);
-	ds3000_tuner_writereg(state, 0x50, 0x00);
-	msleep(60);
-
-	offset_khz = (ndiv - ndiv % 2 + 1024) * DS3000_XTAL_FREQ
-		/ (6 + 8) / (div4 + 1) / 2 - p->frequency;
-
+	if (fe->ops.tuner_ops.set_params)
+		fe->ops.tuner_ops.set_params(fe,p);
 	/* ds3000 global reset */
 	ds3000_writereg(state, 0x07, 0x80);
 	ds3000_writereg(state, 0x07, 0x00);
@@ -1206,7 +1028,11 @@ static int ds3000_set_frontend(struct dvb_frontend *fe,
 	/* start ds3000 build-in uC */
 	ds3000_writereg(state, 0xb2, 0x00);
 
-	ds3000_set_carrier_offset(fe, offset_khz);
+	if (fe->ops.tuner_ops.get_frequency) {
+		fe->ops.tuner_ops.get_frequency(fe, &frequency);
+		offset_khz = frequency - c->frequency;
+		ds3000_set_carrier_offset(fe, offset_khz);
+	} 
 
 	for (i = 0; i < 30 ; i++) {
 		ds3000_read_status(fe, &status);
@@ -1238,6 +1064,11 @@ static int ds3000_tune(struct dvb_frontend *fe,
 
 static enum dvbfe_algo ds3000_get_algo(struct dvb_frontend *fe)
 {
+  struct ds3000_state *state = fe->demodulator_priv;
+
+  if (state->config->set_lock_led)
+    state->config->set_lock_led(fe, 0);
+ 
 	dprintk("%s()\n", __func__);
 	return DVBFE_ALGO_HW;
 }
@@ -1257,10 +1088,6 @@ static int ds3000_initfe(struct dvb_frontend *fe)
 	ds3000_writereg(state, 0x08, 0x01 | ds3000_readreg(state, 0x08));
 	msleep(1);
 
-	/* TS2020 init */
-	ds3000_tuner_writereg(state, 0x42, 0x73);
-	ds3000_tuner_writereg(state, 0x05, 0x01);
-	ds3000_tuner_writereg(state, 0x62, 0xf5);
 	/* Load the firmware if required */
 	ret = ds3000_firmware_ondemand(fe);
 	if (ret != 0) {
@@ -1271,17 +1098,10 @@ static int ds3000_initfe(struct dvb_frontend *fe)
 	return 0;
 }
 
-/* Put device to sleep */
-static int ds3000_sleep(struct dvb_frontend *fe)
-{
-	dprintk("%s()\n", __func__);
-	return 0;
-}
-
 static struct dvb_frontend_ops ds3000_ops = {
 
 	.info = {
-		.name = "Montage Technology DS3000/TS2020",
+		.name = "Montage Technology DS3000",
 		.type = FE_QPSK,
 		.frequency_min = 950000,
 		.frequency_max = 2150000,
@@ -1300,7 +1120,7 @@ static struct dvb_frontend_ops ds3000_ops = {
 	.release = ds3000_release,
 
 	.init = ds3000_initfe,
-	.sleep = ds3000_sleep,
+	.i2c_gate_ctrl = ds3000_i2c_gate_ctrl,
 	.read_status = ds3000_read_status,
 	.read_ber = ds3000_read_ber,
 	.read_signal_strength = ds3000_read_signal_strength,
@@ -1322,6 +1142,7 @@ module_param(debug, int, 0644);
 MODULE_PARM_DESC(debug, "Activates frontend debugging (default:0)");
 
 MODULE_DESCRIPTION("DVB Frontend module for Montage Technology "
-			"DS3000/TS2020 hardware");
-MODULE_AUTHOR("Konstantin Dimitrov");
+      "DS3000 hardware");
+MODULE_AUTHOR("Konstantin Dimitrov <kosio.dimitrov@gmail.com>"); 
 MODULE_LICENSE("GPL");
+MODULE_FIRMWARE(DS3000_DEFAULT_FIRMWARE);
